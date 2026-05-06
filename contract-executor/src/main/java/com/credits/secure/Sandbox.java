@@ -46,7 +46,19 @@ public final class Sandbox {
     private Sandbox() {
     }
 
-    private static final Map<Class<?>, AccessControlContext> CHECKED_CLASSES = Collections.synchronizedMap(new WeakHashMap<>());
+    // Per-class confined permissions. The previous attempt at a WeakHashMap failed
+    // because the value (AccessControlContext) transitively keeps the Class key
+    // alive: ACC -> ProtectionDomain -> ClassLoader -> all classes loaded by it,
+    // including the key class itself. The bounded LRU that replaced it then
+    // pinned thousands of contract classloaders in metaspace.
+    //
+    // Storing only the Permissions snapshot breaks that retention chain — a
+    // Permissions object is a flat collection of Permission instances and does
+    // not reference back to the Class or its ClassLoader. With that, a true
+    // weak-keyed map works: when the contract Class becomes unreachable
+    // elsewhere, this entry is collected automatically.
+    private static final Map<Class<?>, Permissions> CHECKED_CLASSES =
+        Collections.synchronizedMap(new WeakHashMap<>());
 
     static {
         // Install our custom security manager.
@@ -59,17 +71,12 @@ public final class Sandbox {
 
             @Override
             public void checkPermission(Permission perm) {
-                //System.out.println("Check permission" + perm.toString());
                 assert perm != null;
                 for (Class<?> clasS : this.getClassContext()) {
-                    // Check if an ACC was set for the class.
-                    AccessControlContext acc = Sandbox.CHECKED_CLASSES.get(clasS);
-                    if (acc != null) {
-                        try {
-                            acc.checkPermission(perm);
-                        } catch (AccessControlException e) {
-                            throw new AccessControlException("class " + clasS.getTypeName() + " " + e.getMessage());
-                        }
+                    Permissions perms = Sandbox.CHECKED_CLASSES.get(clasS);
+                    if (perms != null && !perms.implies(perm)) {
+                        throw new AccessControlException(
+                            "class " + clasS.getTypeName() + " access denied (" + perm + ")", perm);
                     }
                 }
             }
@@ -77,37 +84,38 @@ public final class Sandbox {
     }
 
     /**
-     * All future actions that are executed through the given {@code clasS} will be checked against the given {@code
-     * accessControlContext}.
-     *
-     * @throws SecurityException Permissions are already confined for the {@code clasS}
-     */
-    public static void confine(Class<?> clasS, AccessControlContext accessControlContext) {
-        //System.out.println("Sandbox confine 1:" + clasS.getName());
-        if (!Sandbox.CHECKED_CLASSES.containsKey(clasS)) {
-            Sandbox.CHECKED_CLASSES.put(clasS, accessControlContext);
-        }
-    }
-
-    /**
-     * All future actions that are executed through the given {@code clasS} will be checked against the given {@code
-     * protectionDomain}.
-     *
-     * @throws SecurityException Permissions are already confined for the {@code clasS}
-     */
-    public static void confine(Class<?> clasS, ProtectionDomain protectionDomain) {
-        //System.out.println("Sandbox confine 2:" + clasS.getName());
-        Sandbox.confine(clasS, new AccessControlContext(new ProtectionDomain[] {protectionDomain}));
-    }
-
-    /**
-     * All future actions that are executed through the given {@code clasS} will be checked against the given {@code
-     * permissions}.
-     *
-     * @throws SecurityException Permissions are already confined for the {@code clasS}
+     * All future actions executed through {@code clasS} will be checked against {@code permissions}.
+     * The first call wins; subsequent calls are ignored to preserve the original
+     * "permissions cannot be relaxed" guarantee.
      */
     public static void confine(Class<?> clasS, Permissions permissions) {
-        //System.out.println("Sandbox confine 3:" + clasS.getName());
-        Sandbox.confine(clasS, new ProtectionDomain(clasS.getProtectionDomain().getCodeSource(), permissions));
+        Sandbox.CHECKED_CLASSES.putIfAbsent(clasS, permissions);
+    }
+
+    /**
+     * Convenience overload: confines using the {@link ProtectionDomain}'s permissions.
+     */
+    public static void confine(Class<?> clasS, ProtectionDomain protectionDomain) {
+        PermissionCollection pc = protectionDomain.getPermissions();
+        Permissions perms = new Permissions();
+        if (pc != null) {
+            java.util.Enumeration<Permission> e = pc.elements();
+            while (e.hasMoreElements()) perms.add(e.nextElement());
+        }
+        Sandbox.confine(clasS, perms);
+    }
+
+    /**
+     * Convenience overload: confines using the permissions of the first
+     * {@link ProtectionDomain} encoded in the given {@link AccessControlContext}.
+     * Kept for source-level compatibility with prior callers.
+     */
+    public static void confine(Class<?> clasS, AccessControlContext accessControlContext) {
+        // ACC's internal ProtectionDomains are not directly exposed; we approximate
+        // by storing an empty Permissions set, which yields the safest (most
+        // restrictive) behavior. In this codebase ACC is only constructed
+        // internally from a single ProtectionDomain via the (Class, ProtectionDomain)
+        // overload above, so this fallback is unreachable in practice.
+        Sandbox.confine(clasS, new Permissions());
     }
 }

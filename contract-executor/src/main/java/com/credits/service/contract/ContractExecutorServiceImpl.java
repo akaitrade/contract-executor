@@ -59,7 +59,8 @@ public class ContractExecutorServiceImpl implements ContractExecutorService {
 
     @Override
     public ReturnValue deploySmartContract(DeployContractSession session) throws ContractExecutorException {
-        final var contractClass = findRootClass(compileClassesAndDropPermissions(session.byteCodeObjectDataList, getSmartContractClassLoader()));
+        final var contractClassLoader = new ByteCodeContractClassLoader();
+        final var contractClass = findRootClass(compileClassesAndDropPermissions(session.byteCodeObjectDataList, contractClassLoader));
         permissionManager.dropSmartContractRights(contractClass);
         final var methodResult = new Deployer(session, contractClass).deploy();
         final var newContractState = methodResult.getInvokedObject() != null
@@ -74,8 +75,12 @@ public class ContractExecutorServiceImpl implements ContractExecutorService {
 
     @Override
     public ReturnValue executeSmartContract(InvokeMethodSession session) throws ContractExecutorException {
-        final var contractClassLoader = getSmartContractClassLoader();
-        loadClassesToClassloader(session.byteCodeObjectDataList,contractClassLoader);
+        // Fresh loader per execute: <clinit> runs once per Class<?> instance, so
+        // sharing a Class across calls would let static-field state bleed between
+        // invocations and diverge between nodes with different LRU history.
+        // Sandbox WeakHashMap fix makes discarded loaders GC-eligible.
+        final var contractClassLoader = new ByteCodeContractClassLoader();
+        loadClassesToClassloader(session.byteCodeObjectDataList, contractClassLoader);
         final var instance = deserialize(session.contractState, contractClassLoader);
 
         initNonStaticContractFields(session, instance);

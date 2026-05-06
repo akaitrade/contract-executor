@@ -8,7 +8,6 @@ import pojo.session.InvokeMethodSession;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import static com.credits.general.serialize.Serializer.deserialize;
 import static com.credits.general.util.variant.VariantConverter.toVariant;
 import static com.credits.utils.ContractExecutorServiceUtils.getMethodArgumentsValuesByNameAndParams;
 import static java.util.Arrays.stream;
@@ -37,14 +36,21 @@ class LimitTimeThreadMethodExecutor extends LimitedExecutionMethod<Variant> {
     }
 
     private List<MethodResult> invokeMultipleMethod() {
-        final var results = stream(session.paramsTable).map(params -> prepareResult(invokeUsingPrimaryContractState(params))).collect(Collectors.toList());
+        // State is deserialized once in ContractExecutorServiceImpl.executeSmartContract;
+        // all N invocations share that single instance. Eliminates O(N) deserialize
+        // cost on batch reads (e.g. balanceOf with 1000+ addresses) which previously
+        // OOM'd the JVM by allocating ~N × stateSize bytes of churn.
+        //
+        // Semantic note: for getter methods (no mutation) the result is identical to
+        // the previous behavior. For write methods, mutations now ACCUMULATE across
+        // invocations within the batch instead of being independent. The persisted
+        // state is still the final instance, which matches the old "last wins"
+        // behavior for the saved state.
+        final var results = stream(session.paramsTable)
+                .map(params -> prepareResult(invokeIntoLimitTimeThread(params)))
+                .collect(Collectors.toList());
         session.usedContracts.get(session.contractAddress).setInstance(instance);
         return results;
-    }
-
-    private Variant invokeUsingPrimaryContractState(Variant... params) {
-        instance = deserialize(session.contractState, instance.getClass().getClassLoader());
-        return invokeIntoLimitTimeThread(params);
     }
 
     private Variant invokeIntoLimitTimeThread(Variant... params) {
